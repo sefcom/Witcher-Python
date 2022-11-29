@@ -21,6 +21,7 @@
 #include "structmember.h"
 
 #include <ctype.h>
+#include <stdbool.h>
 
 #ifdef Py_DEBUG
 /* For debugging the interpreter: */
@@ -525,11 +526,11 @@ Witcher additions
 
 #define MAPSIZE 65536
 #define SHM_ENV_VAR         "__AFL_SHM_ID"
-char str_address[8];
+char str_address[24];
 int start_tracing=0;
 unsigned long hash;
 static unsigned char *afl_area_ptr = NULL;
-struct test_process_info {
+struct httpreqr_info_t {
     int initialized;
     int afl_id;
     int port;
@@ -537,113 +538,40 @@ struct test_process_info {
     int process_id;
     char error_type[20]; /* SQL, Command */
     char error_msg[100];
+    bool capture;
 };
-#define TEST_PROCESS_INFO_SHM_ID 0x411911
-#define TEST_PROCESS_INFO_MAX_NBR 100
-#define TEST_PROCESS_INFO_SMM_SIZE 0x4000
-struct test_process_info *tp_info_this = NULL;
-struct test_process_info *tp_info_all = NULL;
+static struct httpreqr_info_t *httpreqr_info = NULL;
+static int afl_meta = 0, current_afl_id = 0, ins_count=0;
+bool firstpass = true;
 
-void error_handler(int nSignum, siginfo_t* si, void* vcontext) {
-    // this is slick, it sends the SIGSEGV to the forked process and then continues with this process lik it never happened.
-    strcpy(tp_info_this->error_type,"COMMAND");
-    printf("\033[36m [Witcher] sending SEGSEGV to %d %d %d !!!\033[0m\n", tp_info_this->reqr_process_id, tp_info_this->process_id, getpid());
-    fflush(stdout);
-    kill(tp_info_this->reqr_process_id, SIGSEGV);
-
-    ucontext_t* context = (ucontext_t*)vcontext;
-    context->uc_mcontext.gregs[REG_RIP]++;
-
-}
-/**
-cgi_get_shm_mem looks in SHM_ENV_VAR for shared memory identifier, if not found it then tries to get it from
-/tmp/${PORT}.afl, the PORT is the one the flask application is using.
-*/
-unsigned char *cgi_get_shm_mem() {
-    int shm_id;
-    FILE *fp = NULL;
-    short inited=0;
-
-    // this only works once per AFL run, if AFL dies the python app and AFL must be restarted.
-    if (afl_area_ptr == NULL){
-
-        // get test_process_info from shared memory
-        if (!tp_info_all ){
-            key_t mem_key = ftok("/tmp",'W');
-            printf(" mem_key %x \n", mem_key);
-            fflush(stdout);
-            int tp_shm_id = shmget(mem_key, TEST_PROCESS_INFO_SMM_SIZE, 0666);
-
-            //int tp_shm_id = shmget(mem_key, TEST_PROCESS_INFO_SMM_SIZE, IPC_CREAT | 0666);
-            if (tp_shm_id < 0 ) {
-                printf(" did not find tp_shm_id (%d) using %x \n", tp_shm_id, TEST_PROCESS_INFO_SHM_ID );
-                return NULL;
-            } else {
-                printf(" found tp_shm_id (%x) using %x \n", tp_shm_id, TEST_PROCESS_INFO_SHM_ID );
-            }
-
-            tp_info_all = (struct test_process_info *) shmat(tp_shm_id, NULL, 0);  /* attach */
-            if ((long) tp_info_all == -1) {
-                printf(" did not find tp_info shared memory\n");
-                return NULL;
-            } else {
-                printf(" found tp_info_all = %p  \n", tp_info_all  );
-            }
-            for (int x=0; x < TEST_PROCESS_INFO_MAX_NBR; x++){
-                if (tp_info_all[x].initialized == 31337){
-                    printf("\ton port = %d \n", tp_info_all[x]);
-                }
-            }
-            fflush(stdout);
-        }
-        if (!tp_info_this){
-            for (int x=0; x < TEST_PROCESS_INFO_MAX_NBR; x++){
-                if (tp_info_all[x].initialized == 31337){
-                    inited = 1;
-                    break;
-                }
-            }
-            if (!inited){
-                return NULL;
-            }
-
-            // get port for lookup
-            char *portstr = getenv("PORT") ? getenv("PORT") : getenv("FLASK_RUN_PORT");
-            if (!portstr){
-                printf("port is null\n");
-                return NULL;
-            }
-            fflush(stdout);
-            // lookup tp info by port and set afl_area_ptr and process_id
-            int port = atoi(portstr);
-            for (int x=0; x < TEST_PROCESS_INFO_MAX_NBR; x++){
-                if (tp_info_all[x].port == port){
-                    afl_area_ptr = (unsigned char*)  shmat(tp_info_all[x].afl_id, NULL, 0);
-                    if (afl_area_ptr == (void *) -1){
-                        tp_info_all[x].initialized=0;
-                        tp_info_all[x].port=0;
-                        tp_info_all[x].afl_id=0;
-                        printf("[Witcher] shmat returned -1 b/c %d is a prior value, clearing out stale information \n", tp_info_all[x].afl_id);
-                        afl_area_ptr = NULL;
-                        return NULL;
-                    }
-
-                    struct sigaction action;
-                    memset(&action, 0, sizeof(struct sigaction));
-                    action.sa_flags = SA_SIGINFO;
-                    action.sa_sigaction = error_handler;
-                    sigaction(SIGSEGV, &action, NULL);
-
-                    //signal(SIGSEGV, error_handler);
-                    tp_info_all[x].process_id = getpid();
-                    tp_info_this = tp_info_all + x;
-                    return afl_area_ptr;
-                }
+void afl_error_handler(int nSignum) {
+    // make sure most recent
+    if (getenv("AFL_META_INFO_ID")){
+        FILE *elog = fopen("/tmp/witcher.log","a+");
+        int mem_key = atoi(getenv("AFL_META_INFO_ID"));
+        int shm_id = shmget(mem_key , sizeof(struct httpreqr_info_t), 0666);
+        if (shm_id  >= 0 ) {
+            httpreqr_info = (struct httpreqr_info_t *) shmat(shm_id, NULL, 0);  /* attach */
+            if (elog) {
+                fprintf(elog, "\033[36m[Witcher] set httpreqr_info=%p!!!\033[0m\n", httpreqr_info);
             }
         }
-        return NULL;
+        if (elog){
+            fprintf(elog, "\033[36m[Witcher] sending SEGSEGV to reqr_process_id=%d pid=%d last_insn=%d afl_id=%d capture=%d!!!\033[0m\n",
+                    httpreqr_info->reqr_process_id, getpid(), ins_count, httpreqr_info->afl_id, httpreqr_info->capture);
+            fclose(elog);
+        }
+        if (httpreqr_info->reqr_process_id != 0){
+            kill(httpreqr_info->reqr_process_id, SIGSEGV);
+        }
+        //strcpy(httpreqr_info->error_type,"COMMAND");
+    } else {
+        FILE *elog = fopen("/tmp/witcher.log","a+");
+        if (elog){
+            fprintf(elog, "\033[36m[Witcher] detected error in child but AFL_META_INFO_ID is not set. !!!\033[0m\n");
+            fclose(elog);
+        }
     }
-    return afl_area_ptr;
 }
 
 static ssize_t (*real_recv) (int sockfd, void *buf, size_t len, int flags) = NULL;
@@ -687,9 +615,9 @@ ssize_t recv (int sockfd, void *buf, size_t len, int flags) {
           char* strict = getenv("STRICT");
           if (strict){
               //raise(SIGSEGV);
-              printf("\033[36m [Witcher] sending SEGSEGV for SQL to %d %d %d !!!\033[0m\n", tp_info_this->reqr_process_id, tp_info_this->process_id, getpid());
+              printf("\033[36m [Witcher] sending SEGSEGV for SQL to %d %d %d !!!\033[0m\n", httpreqr_info->reqr_process_id, httpreqr_info->process_id, getpid());
               fflush(stdout);
-              kill(tp_info_this->reqr_process_id, SIGSEGV);
+              kill(httpreqr_info->reqr_process_id, SIGSEGV);
           } else {
               printf("RECV ERROR FROM DATABASE FOUND!!!!! \n");
           }
@@ -701,33 +629,138 @@ ssize_t recv (int sockfd, void *buf, size_t len, int flags) {
   return results;
 
 }
+void remove_shm(void){
+    FILE *elog = fopen("/tmp/witcher.log","a+");
+    if (elog) {
+        fprintf(elog, "\n\n@@@@@@@@@@@@@@@@@ IN FUNC @@@@@@@@@@@@@@@@@\n\n");
+        fclose(elog);
+    }
+    printf("\n\n@@@@@@@@@@@@@@@@@ IN FUNC @@@@@@@@@@@@@@@@@\n\n");
+    if (httpreqr_info && httpreqr_info->afl_id != 0 ){
+        printf("\n\n@@@@@@@@@@@@@@@@@ REMOVING SHM @@@@@@@@@@@@@@@@@\n\n");
+        int mem_key;
+        if (afl_meta){
+            mem_key = afl_meta;
+        } else if (getenv("")){
+            mem_key = atoi(getenv("AFL_META_INFO_ID"));
+        } else {
+            printf("\n\n PSYCHE \n\n");
+            return;
+        }
+
+        int shm_id = shmget(mem_key , sizeof(struct httpreqr_info_t), 0666);
+        if (shm_id  >= 0 ) {
+            shmctl(shm_id, IPC_RMID, NULL);
+        }
+    }
+}
+
+void init_shared_mem(void) {
+
+    if (afl_meta == 0 && getenv("AFL_META_INFO_ID") ){
+        afl_meta = atoi(getenv("AFL_META_INFO_ID") );
+    }
+    if (httpreqr_info == NULL && afl_meta != 0) {
+        bool create_shm = true;
+        // clean up last shared memory area
+        int mem_key = atoi(getenv("AFL_META_INFO_ID"));
+        int shm_id = shmget(mem_key , sizeof(struct httpreqr_info_t), 0666);
+        if (shm_id  >= 0 ) {
+            httpreqr_info = (struct httpreqr_info_t *) shmat(shm_id, NULL, 0);  /* attach */
+            if (httpreqr_info && httpreqr_info->afl_id != 0 ){
+                // if record exists we only clean up if afl_id is already set and then we fork,
+                // hopefully this will limit clean up to when needed even when the damn thing forks
+                shmctl(shm_id, IPC_RMID, NULL);
+            } else {
+                create_shm = false;
+            }
+        }
+        if (create_shm){
+            printf("\n\n*** creating shm memory %x \n", mem_key);
+            shm_id = shmget(mem_key , sizeof(struct httpreqr_info_t), IPC_CREAT | 0666);
+            if (shm_id < 0 ) {
+                //printf("*** shmget error (server) ***\n");
+                perror("*** shmget error (server) *** ERROR: ");
+                exit(1);
+            }
+
+        } else {
+            atexit(remove_shm);
+            printf("\n\nUsing existing shm\n\n");
+        }
+
+        httpreqr_info = (struct httpreqr_info_t *) shmat(shm_id, NULL, 0);  /* attach */
+        memset(httpreqr_info, 0, sizeof(struct httpreqr_info_t));
+
+        httpreqr_info->process_id = getpid();
+        if (httpreqr_info->initialized != 199){
+            printf("\nAFL %d info afl_meta=%d httpreqr_id=%u state=%d AFL info addr=%p id=%d pid=%d, cap=%d", getpid(), afl_meta, shm_id, httpreqr_info->initialized, httpreqr_info, httpreqr_info->afl_id,  httpreqr_info->process_id, httpreqr_info->capture );
+            FILE *elog = fopen("/tmp/witcher.log","a+");
+            if (elog){
+                fprintf(elog, "AFL %d info afl_meta=%d httpreqr_id=%u state=%d AFL info addr=%p id=%d pid=%d, cap=%d\n", getpid(), afl_meta, shm_id, httpreqr_info->initialized, httpreqr_info, httpreqr_info->afl_id,  httpreqr_info->process_id, httpreqr_info->capture );
+                fclose(elog);
+            }
+        }
+
+        httpreqr_info->initialized = 199;
+
+        printf("\n");
+    }
 
 
+    if (httpreqr_info){
+        if (firstpass){
+            firstpass = false;
+            printf("\033[36mWitcher is being executed and adding sig handler\n\033[0m");
+            FILE *elog = fopen("/tmp/witcher.log","a+");
+            if (elog){
+                fprintf(elog, "\033[36mWitcher is being executed and adding sig handler\n\033[0m");
+                fclose(elog);
+            }
+            signal(SIGUSR1, afl_error_handler);
+            fflush(stdout);
+        }
+
+        //printf("[WC] %d \n", httpreqr_info->afl_id);
+        if (afl_area_ptr == NULL && httpreqr_info->afl_id != 0){
+            httpreqr_info->initialized = 10;
+            //printf("[WC] Using %d to attach to afl_area_ptr\n", httpreqr_info->afl_id);
+            current_afl_id = httpreqr_info->afl_id;
+            afl_area_ptr = (unsigned char*)  shmat(httpreqr_info->afl_id, NULL, 0);
+        }
+//        if (httpreqr_info->initialized == 10){
+//            printf("aap=%p init=%d afl_id=%d port=%d rpid=%d pid=%d err=%s->%s, cap=%d\n", afl_area_ptr, httpreqr_info->initialized, httpreqr_info->afl_id, httpreqr_info->port,
+//               httpreqr_info->reqr_process_id, httpreqr_info->process_id, httpreqr_info->error_type, httpreqr_info->error_msg, httpreqr_info->capture);
+//
+//        }
+    }
+
+}
+void afl_maybe_log(uint32_t cur_loc) {
+
+    if (httpreqr_info && httpreqr_info->afl_id != current_afl_id){
+        current_afl_id = httpreqr_info->afl_id;
+        if (httpreqr_info->afl_id != 0){
+            afl_area_ptr = (unsigned char*)  shmat(httpreqr_info->afl_id, NULL, 0);
+        } else {
+
+            afl_area_ptr = NULL;
+        }
+    }
+    if (afl_area_ptr == NULL || httpreqr_info == NULL || !httpreqr_info->capture){
+      return;
+   }
+    afl_area_ptr[cur_loc] ++;
+}
 
 #define WITCHER_TRACE() \
-    { \
-        if (start_tracing == 1) { \
-            if (afl_area_ptr == NULL) { \
-                cgi_get_shm_mem(); \
-            } \
-            if (afl_area_ptr != NULL) { \
-                sprintf(str_address,"%d%d",f->f_lasti, f->f_lineno); \
-                int hash = atoi(str_address); \
-                afl_area_ptr[hash % MAPSIZE]++; \
-                /*printf("[Witcher] 2INS:%06d@%06d:opcode=%3d => str=%8s hash=%8x short=:%4x:cnt=:%d:exec=%d\n", f->f_lineno, f->f_lasti, opcode, str_address, hash, hash%MAPSIZE, afl_area_ptr[hash%MAPSIZE], f->f_executing);*/ \
-            } \
-        } else { \
-            if (opcode == 108 || opcode == 109 || opcode == 84) { \
-                wchar_t *wstr = (wchar_t *) (((PyASCIIObject*)f->f_code->co_filename) + 1); \
-                char *scriptfn = getenv("SCRIPT_FILENAME"); \
-                if (scriptfn && strcmp((char *) wstr, scriptfn) == 0 ) { \
-                    start_tracing = 1; \
-                } \
-                char *flask_app = getenv("FLASK_APP");  \
-                if (flask_app && strcmp((char *) wstr, flask_app) == 0 ) { \
-                    start_tracing = 1; \
-                } \
-            } \
+    {                   \
+        if (afl_area_ptr == NULL) { \
+            init_shared_mem();      \
+        } else if (f) {        \
+            sprintf(str_address,"%d%d",f->f_lasti, f->f_lineno); \
+            uint32_t hash = atoi(str_address);                        \
+            afl_maybe_log(hash % MAPSIZE);            \
         } \
     }
 
@@ -845,15 +878,15 @@ _PyEval_EvalFrameDefault(PyFrameObject *f, int throwflag)
 #endif
 
 #ifdef HAVE_COMPUTED_GOTOS
-    #ifndef USE_COMPUTED_GOTOS
-    #define USE_COMPUTED_GOTOS 1
-    #endif
+#ifndef USE_COMPUTED_GOTOS
+#define USE_COMPUTED_GOTOS 1
+#endif
 #else
-    #if defined(USE_COMPUTED_GOTOS) && USE_COMPUTED_GOTOS
-    #error "Computed gotos are not supported on this compiler."
-    #endif
-    #undef USE_COMPUTED_GOTOS
-    #define USE_COMPUTED_GOTOS 0
+#if defined(USE_COMPUTED_GOTOS) && USE_COMPUTED_GOTOS
+#error "Computed gotos are not supported on this compiler."
+#endif
+#undef USE_COMPUTED_GOTOS
+#define USE_COMPUTED_GOTOS 0
 #endif
 
 #if USE_COMPUTED_GOTOS
